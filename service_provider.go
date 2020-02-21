@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sync"
 	"time"
 
 	"github.com/beevik/etree"
@@ -98,9 +99,28 @@ type ServiceProvider struct {
 	// AllowIdpInitiated
 	AllowIDPInitiated bool
 
+	// AuthNRequestsSigned allows defining if the SP will sign the AuthN requests
+	// sent to the IDP or not
+	AuthNRequestsSigned            bool
+	SignAuthnRequestsAlgorithm     string
+	SignAuthnRequestsCanonicalizer dsig.Canonicalizer
+
 	// SignatureVerifier, if non-nil, allows you to implement an alternative way
 	// to verify signatures.
 	SignatureVerifier SignatureVerifier
+
+	signingContextMu sync.RWMutex
+	signingContext   *dsig.SigningContext
+}
+
+// GetKeyPair implements the X509KeyStore interface
+func (sp *ServiceProvider) GetKeyPair() (privateKey *rsa.PrivateKey, cert []byte, err error) {
+	if sp.Key == nil {
+		return nil, nil, errors.New("private key not defined")
+	} else if sp.Certificate == nil || sp.Certificate.Raw == nil {
+		return nil, nil, errors.New("certificate not defined or raw data not available")
+	}
+	return sp.Key, sp.Certificate.Raw, nil
 }
 
 // MaxIssueDelay is the longest allowed time between when a SAML assertion is
@@ -126,7 +146,7 @@ func (sp *ServiceProvider) Metadata() *EntityDescriptor {
 		validDuration = sp.MetadataValidDuration
 	}
 
-	authnRequestsSigned := false
+	authnRequestsSigned := sp.AuthNRequestsSigned
 	wantAssertionsSigned := true
 	validUntil := TimeNow().Add(validDuration)
 
@@ -201,18 +221,22 @@ func (sp *ServiceProvider) MakeRedirectAuthenticationRequest(relayState string) 
 	if err != nil {
 		return nil, err
 	}
-	return req.Redirect(relayState), nil
+	return req.Redirect(relayState)
 }
 
 // Redirect returns a URL suitable for using the redirect binding with the request
-func (req *AuthnRequest) Redirect(relayState string) *url.URL {
+func (req *AuthnRequest) Redirect(relayState string) (*url.URL, error) {
 	w := &bytes.Buffer{}
 	w1 := base64.NewEncoder(base64.StdEncoding, w)
 	w2, _ := flate.NewWriter(w1, 9)
 	doc := etree.NewDocument()
-	doc.SetRoot(req.Element())
+	el, err := req.Element()
+	if err != nil {
+		return nil, err
+	}
+	doc.SetRoot(el)
 	if _, err := doc.WriteTo(w2); err != nil {
-		panic(err)
+		return nil, err
 	}
 	w2.Close()
 	w1.Close()
@@ -226,7 +250,7 @@ func (req *AuthnRequest) Redirect(relayState string) *url.URL {
 	}
 	rv.RawQuery = query.Encode()
 
-	return rv
+	return rv, nil
 }
 
 // GetSSOBindingLocation returns URL for the IDP's Single Sign On Service binding
@@ -329,6 +353,7 @@ func (sp *ServiceProvider) MakeAuthenticationRequest(idpURL string) (*AuthnReque
 			Format: &nameIDFormat,
 		},
 		ForceAuthn: sp.ForceAuthn,
+		sp:         sp,
 	}
 	return &req, nil
 }
@@ -341,16 +366,20 @@ func (sp *ServiceProvider) MakePostAuthenticationRequest(relayState string) ([]b
 	if err != nil {
 		return nil, err
 	}
-	return req.Post(relayState), nil
+	return req.Post(relayState)
 }
 
 // Post returns an HTML form suitable for using the HTTP-POST binding with the request
-func (req *AuthnRequest) Post(relayState string) []byte {
+func (req *AuthnRequest) Post(relayState string) ([]byte, error) {
 	doc := etree.NewDocument()
-	doc.SetRoot(req.Element())
+	el, err := req.Element()
+	if err != nil {
+		return nil, err
+	}
+	doc.SetRoot(el)
 	reqBuf, err := doc.WriteToBytes()
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 	encodedReqBuf := base64.StdEncoding.EncodeToString(reqBuf)
 
@@ -374,10 +403,10 @@ func (req *AuthnRequest) Post(relayState string) []byte {
 
 	rv := bytes.Buffer{}
 	if err := tmpl.Execute(&rv, data); err != nil {
-		panic(err)
+		return nil, err
 	}
 
-	return rv.Bytes()
+	return rv.Bytes(), err
 }
 
 // AssertionAttributes is a list of AssertionAttribute
@@ -1021,4 +1050,62 @@ func firstSet(a, b string) string {
 		return b
 	}
 	return a
+}
+
+// SignAuthnRequest takes a document, builds a signature, creates another document
+// and inserts the signature in it. According to the schema, the position of the
+// signature is right after the Issuer [1] then all other children.
+//
+// [1] https://docs.oasis-open.org/security/saml/v2.0/saml-schema-protocol-2.0.xsd
+func (sp *ServiceProvider) SignAuthnRequest(el *etree.Element) (*etree.Element, error) {
+	ctx, err := sp.SigningContext()
+	if err != nil {
+		return nil, err
+	}
+	var sig *etree.Element
+	sig, err = ctx.ConstructSignature(el, true)
+	if err != nil {
+		return nil, err
+	}
+
+	ret := el.Copy()
+
+	var children []etree.Token
+	children = append(children, ret.Child[0])     // issuer is always first
+	children = append(children, sig)              // next is the signature
+	children = append(children, ret.Child[1:]...) // then all other children
+	ret.Child = children
+
+	return ret, nil
+}
+
+
+func (sp *ServiceProvider) SigningContext() (*dsig.SigningContext, error) {
+	sp.signingContextMu.RLock()
+
+	if sp.signingContext != nil {
+		sp.signingContextMu.RUnlock()
+		return sp.signingContext, nil
+	}
+
+	sp.signingContextMu.RUnlock()
+	sp.signingContextMu.Lock()
+	defer sp.signingContextMu.Unlock()
+
+	// Need to recheck this cause the RUnlock->Lock is not atomic.
+	if sp.signingContext != nil {
+		return sp.signingContext, nil
+	}
+
+
+	sp.signingContext = dsig.NewDefaultSigningContext(sp)
+	if sp.SignAuthnRequestsCanonicalizer != nil {
+		sp.signingContext.Canonicalizer = sp.SignAuthnRequestsCanonicalizer
+	}
+	if err := sp.signingContext.SetSignatureMethod(sp.SignAuthnRequestsAlgorithm); err != nil {
+		sp.signingContext = nil
+		return nil, err
+	}
+
+	return sp.signingContext, nil
 }

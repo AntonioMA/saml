@@ -155,7 +155,11 @@ func (m *Middleware) HandleStartAuthFlow(w http.ResponseWriter, r *http.Request)
 	}
 
 	if binding == saml.HTTPRedirectBinding {
-		redirectURL := authReq.Redirect(relayState)
+		redirectURL, err := authReq.Redirect(relayState)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 		w.Header().Add("Location", redirectURL.String())
 		w.WriteHeader(http.StatusFound)
 		return
@@ -167,7 +171,12 @@ func (m *Middleware) HandleStartAuthFlow(w http.ResponseWriter, r *http.Request)
 			"reflected-xss block; referrer no-referrer;")
 		w.Header().Add("Content-type", "text/html")
 		w.Write([]byte(`<!DOCTYPE html><html><body>`))
-		w.Write(authReq.Post(relayState))
+		postData, err := authReq.Post(relayState)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Write(postData)
 		w.Write([]byte(`</body></html>`))
 		return
 	}
