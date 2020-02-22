@@ -82,8 +82,16 @@ func (m *Middleware) serveACS(w http.ResponseWriter, r *http.Request) {
 	for _, tr := range trackedRequests {
 		possibleRequestIDs = append(possibleRequestIDs, tr.SAMLRequestID)
 	}
+	checkID := func(reqId string) bool {
+		for _, possibleId := range possibleRequestIDs {
+			if reqId == possibleId {
+				return true
+			}
+		}
+		return false
+	}
 
-	assertion, err := m.ServiceProvider.ParseResponse(r, possibleRequestIDs)
+	assertion, err := m.ServiceProvider.ParseResponse(r, checkID)
 	if err != nil {
 		m.OnError(w, r, err)
 		return

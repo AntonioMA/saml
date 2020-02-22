@@ -493,7 +493,7 @@ func (sp *ServiceProvider) validateDestination(response []byte, responseDom *Res
 
 // ParseResponse extracts the SAML IDP response received in req, validates
 // it, and returns the verified assertion.
-func (sp *ServiceProvider) ParseResponse(req *http.Request, possibleRequestIDs []string) (*Assertion, error) {
+func (sp *ServiceProvider) ParseResponse(req *http.Request, idChecker func(string) bool) (*Assertion, error) {
 	now := TimeNow()
 	retErr := &InvalidResponseError{
 		Now:      now,
@@ -506,7 +506,7 @@ func (sp *ServiceProvider) ParseResponse(req *http.Request, possibleRequestIDs [
 		return nil, retErr
 	}
 	retErr.Response = string(rawResponseBuf)
-	assertion, err := sp.ParseXMLResponse(rawResponseBuf, possibleRequestIDs)
+	assertion, err := sp.ParseXMLResponse(rawResponseBuf, idChecker)
 	if err != nil {
 		return nil, err
 	}
@@ -521,12 +521,14 @@ func (sp *ServiceProvider) ParseResponse(req *http.Request, possibleRequestIDs [
 // This function handles decrypting the message, verifying the digital
 // signature on the assertion, and verifying that the specified conditions
 // and properties are met.
+// validId must return true if the value passed (which will hold the InResponseTo
+// value of the response) is valid. The meaning of "valid" is left to the caller
 //
 // If the function fails it will return an InvalidResponseError whose
 // properties are useful in describing which part of the parsing process
 // failed. However, to discourage inadvertent disclosure the diagnostic
 // information, the Error() method returns a static string.
-func (sp *ServiceProvider) ParseXMLResponse(decodedResponseXML []byte, possibleRequestIDs []string) (*Assertion, error) {
+func (sp *ServiceProvider) ParseXMLResponse(decodedResponseXML []byte, idChecker func(string) bool) (*Assertion, error) {
 	now := TimeNow()
 	var err error
 	retErr := &InvalidResponseError{
@@ -551,15 +553,11 @@ func (sp *ServiceProvider) ParseXMLResponse(decodedResponseXML []byte, possibleR
 	if sp.AllowIDPInitiated {
 		requestIDvalid = true
 	} else {
-		for _, possibleRequestID := range possibleRequestIDs {
-			if resp.InResponseTo == possibleRequestID {
-				requestIDvalid = true
-			}
-		}
+		requestIDvalid = idChecker(resp.InResponseTo)
 	}
 
 	if !requestIDvalid {
-		retErr.PrivateErr = fmt.Errorf("`InResponseTo` does not match any of the possible request IDs (expected %v)", possibleRequestIDs)
+		retErr.PrivateErr = fmt.Errorf("`InResponseTo` is not a valid request IDs (got %s)", resp.InResponseTo)
 		return nil, retErr
 	}
 
@@ -643,7 +641,7 @@ func (sp *ServiceProvider) ParseXMLResponse(decodedResponseXML []byte, possibleR
 		}
 	}
 
-	if err := sp.validateAssertion(assertion, possibleRequestIDs, now); err != nil {
+	if err := sp.validateAssertion(assertion, idChecker, now); err != nil {
 		retErr.PrivateErr = fmt.Errorf("assertion invalid: %s", err)
 		return nil, retErr
 	}
@@ -655,7 +653,7 @@ func (sp *ServiceProvider) ParseXMLResponse(decodedResponseXML []byte, possibleR
 // the requirements to accept. If validation fails, it returns an error describing
 // the failure. (The digital signature on the assertion is not checked -- this
 // should be done before calling this function).
-func (sp *ServiceProvider) validateAssertion(assertion *Assertion, possibleRequestIDs []string, now time.Time) error {
+func (sp *ServiceProvider) validateAssertion(assertion *Assertion, idChecker func(string) bool, now time.Time) error {
 	if assertion.IssueInstant.Add(MaxIssueDelay).Before(now) {
 		return fmt.Errorf("expired on %s", assertion.IssueInstant.Add(MaxIssueDelay))
 	}
@@ -663,15 +661,9 @@ func (sp *ServiceProvider) validateAssertion(assertion *Assertion, possibleReque
 		return fmt.Errorf("issuer is not %q", sp.IDPMetadata.EntityID)
 	}
 	for _, subjectConfirmation := range assertion.Subject.SubjectConfirmations {
-		requestIDvalid := false
-		for _, possibleRequestID := range possibleRequestIDs {
-			if subjectConfirmation.SubjectConfirmationData.InResponseTo == possibleRequestID {
-				requestIDvalid = true
-				break
-			}
-		}
-		if !requestIDvalid {
-			return fmt.Errorf("assertion SubjectConfirmation one of the possible request IDs (%v)", possibleRequestIDs)
+		if !idChecker(subjectConfirmation.SubjectConfirmationData.InResponseTo) {
+			return fmt.Errorf("assertion SubjectConfirmation is not a valid ID (%s)",
+				subjectConfirmation.SubjectConfirmationData.InResponseTo)
 		}
 		if subjectConfirmation.SubjectConfirmationData.Recipient != sp.AcsURL.String() {
 			return fmt.Errorf("assertion SubjectConfirmation Recipient is not %s", sp.AcsURL.String())
